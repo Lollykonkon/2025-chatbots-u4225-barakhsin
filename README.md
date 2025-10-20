@@ -13,7 +13,7 @@
 ## Информация о курсе
 
 - **Университет**: [ITMO University](https://itmo.ru/ru/)
-- **Факультет**: [FICT](https://fict.itmo.ru)
+- **Факультет**: [FTMI](https://ftmi.itmo.ru)
 - **Курс**: [Vibe Coding: AI-боты для бизнеса](https://github.com/itmo-ict-faculty/vibe-coding-for-business)
 - **Год**: 2025/2026
 - **Группа**: U4225
