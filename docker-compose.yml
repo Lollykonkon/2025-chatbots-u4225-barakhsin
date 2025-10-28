@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    # Ensure these files exist locally before running compose
+    volumes:
+      - ./storage.json:/app/storage.json
+      - ./credentials.json:/app/credentials.json
+      - ./token.json:/app/token.json
+    restart: unless-stopped
+
+
