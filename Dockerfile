@@ -7,10 +7,10 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy bot source
-COPY bot.py /app/
+COPY calendar_bot.py /app/
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "bot.py"]
+CMD ["python", "calendar_bot.py"]
 
 

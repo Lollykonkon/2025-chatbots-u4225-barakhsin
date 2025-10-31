@@ -8,13 +8,21 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
     filters,
@@ -124,7 +132,335 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/calendar_add <id> — add task as calendar event\n"
         "/calendar_delete <id> — delete calendar event"
     )
-    await update.message.reply_text(text)
+    keyboard = [
+        [KeyboardButton("➕ Add task"), KeyboardButton("📋 List tasks")],
+        [KeyboardButton("ℹ️ Help"), KeyboardButton("🔗 Calendar auth")],
+    ]
+    await update.message.reply_text(
+        text,
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+    )
+
+
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [KeyboardButton(BTN_ADD), KeyboardButton(BTN_LIST)],
+        [KeyboardButton(BTN_EDIT)],
+        [KeyboardButton(BTN_CAL_ADD), KeyboardButton(BTN_CAL_EDIT)],
+        [KeyboardButton(BTN_CAL_AUTH)],
+    ]
+    await update.message.reply_text(
+        "Выберите действие:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+    )
+
+
+async def handle_menu_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.message.text or "").strip()
+    if text == BTN_LIST:
+        await list_tasks(update, context)
+        return
+    if text == BTN_ADD:
+        # Start add wizard
+        await update.message.reply_text("Начнём добавление задачи. Введите название задачи:")
+        context.user_data["new_task"] = {}
+        return
+    if text == "ℹ️ Help":
+        await start(update, context)
+        return
+    if text == BTN_CAL_AUTH:
+        await calendar_auth(update, context)
+        return
+    if text == BTN_CAL_ADD:
+        await choose_task_for_calendar(update, context)
+        return
+    if text == BTN_CAL_EDIT:
+        await choose_task_for_calendar_edit(update, context)
+        return
+    if text == BTN_EDIT:
+        # Offer edit options via lists (priority/due/done)
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton("Изменить приоритет"), KeyboardButton("Изменить дедлайн")],
+             [KeyboardButton("Отметить выполненной")],
+             [KeyboardButton("Назад к меню")]], resize_keyboard=True)
+        await update.message.reply_text("Что изменить?", reply_markup=keyboard)
+    # Fallback
+    await update.message.reply_text("Не понял. Используйте меню или команды /start /menu.")
+
+
+# ---------------------------
+# Conversational wizards (step-by-step)
+# ---------------------------
+ADD_TITLE, ADD_DATETIME, ADD_PRIORITY, ADD_CALENDAR = range(4)
+
+# Russian UI labels
+BTN_ADD = "➕ Добавить задачу"
+BTN_LIST = "📋 Список задач"
+BTN_EDIT = "✏️ Изменить задачу"
+BTN_CAL_ADD = "📆 Добавить в календарь"
+BTN_CAL_EDIT = "🗓 Изменить в календаре"
+BTN_CAL_AUTH = "🔗 Привязать календарь"
+
+
+def build_tasks_keyboard(tasks: List[Dict], action_prefix: str) -> InlineKeyboardMarkup:
+    buttons: List[List[InlineKeyboardButton]] = []
+    for t in tasks[:25]:  # cap to 25 to avoid very large keyboards
+        label = f"{'✅' if t.get('done') else '⬜'} #{t.get('id')} • {t.get('text')[:32]}"
+        buttons.append([
+            InlineKeyboardButton(label, callback_data=f"{action_prefix}|{t.get('id')}")
+        ])
+    return InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([[InlineKeyboardButton("Нет задач", callback_data="noop")]])
+
+
+async def add_wizard_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Введите название задачи:")
+    context.user_data["new_task"] = {}
+    return ADD_TITLE
+
+
+async def add_wizard_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Название пустое. Введите название задачи:")
+        return ADD_TITLE
+    context.user_data["new_task"]["text"] = text
+    await update.message.reply_text("Укажите дату и время в формате YYYY-MM-DD [HH:MM]:")
+    return ADD_DATETIME
+
+
+async def add_wizard_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    due_iso = parse_due_datetime((update.message.text or "").strip().split())
+    if not due_iso:
+        await update.message.reply_text("Неверный формат. Введите YYYY-MM-DD [HH:MM]:")
+        return ADD_DATETIME
+    context.user_data["new_task"]["due_iso"] = due_iso
+    # choose priority (default normal)
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("low", callback_data="prio|low"),
+            InlineKeyboardButton("normal", callback_data="prio|normal"),
+            InlineKeyboardButton("high", callback_data="prio|high"),
+        ]]
+    )
+    await update.message.reply_text("Выберите приоритет (по умолчанию normal):", reply_markup=keyboard)
+    return ADD_PRIORITY
+
+
+async def add_wizard_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    _, pr = (query.data or "|").split("|", 1)
+    context.user_data["new_task"]["priority"] = pr or "normal"
+    # ask add to calendar
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Добавить в календарь", callback_data="addcal|yes"), InlineKeyboardButton("Не добавлять", callback_data="addcal|no")]]
+    )
+    await query.edit_message_text("Добавить эту задачу в Google Calendar?", reply_markup=keyboard)
+    return ADD_CALENDAR
+
+
+async def add_wizard_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    add_to_calendar = (query.data or "|").endswith("yes")
+
+    # Create task now
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    new_id = get_next_task_id(tasks)
+    new_task = {
+        "id": new_id,
+        "text": context.user_data.get("new_task", {}).get("text", ""),
+        "priority": context.user_data.get("new_task", {}).get("priority", "normal"),
+        "done": False,
+        "due_iso": context.user_data.get("new_task", {}).get("due_iso"),
+        "calendar_event_id": None,
+    }
+    tasks.append(new_task)
+    data[chat_id] = tasks
+    write_user_tasks(data)
+
+    # Optionally add to calendar
+    if add_to_calendar:
+        try:
+            class Dummy:
+                pass
+            context.args = [str(new_id)]
+            await calendar_add(update, context)
+        except Exception:
+            pass
+
+    # Show confirmation and then list tasks
+    reply = f"Задача создана: #{new_id} — {new_task['text']} [p:{new_task['priority']}]"
+    if new_task.get("due_iso"):
+        reply += f" | due {new_task['due_iso']}"
+    await query.edit_message_text(reply)
+    # Send list
+    fake_update = update
+    await list_tasks(fake_update, context)
+    context.user_data.pop("new_task", None)
+    return ConversationHandler.END
+
+
+# ----- Actions by selecting a task from a list -----
+async def choose_task_for_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    await update.message.reply_text("Выберите задачу для отметки как выполненной:", reply_markup=build_tasks_keyboard(tasks, "done"))
+
+
+async def choose_task_for_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    await update.message.reply_text("Выберите задачу для изменения приоритета:", reply_markup=build_tasks_keyboard(tasks, "prio_task"))
+
+
+async def choose_task_for_due(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    await update.message.reply_text("Выберите задачу для установки дедлайна:", reply_markup=build_tasks_keyboard(tasks, "due_task"))
+
+
+async def choose_task_for_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    await update.message.reply_text("Выберите задачу для добавления в календарь:", reply_markup=build_tasks_keyboard(tasks, "cal_add"))
+
+
+async def choose_task_for_calendar_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    await update.message.reply_text("Выберите задачу для изменения/удаления события в календаре:", reply_markup=build_tasks_keyboard(tasks, "cal_edit"))
+
+
+async def on_inline_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    payload = (query.data or "|").split("|", 1)
+    action = payload[0]
+    arg = payload[1] if len(payload) > 1 else ""
+
+    def find_task(task_id: int) -> Optional[Dict]:
+        for t in tasks:
+            if t.get("id") == task_id:
+                return t
+        return None
+
+    if action == "done":
+        try:
+            task_id = int(arg)
+        except ValueError:
+            return
+        t = find_task(task_id)
+        if not t:
+            await query.edit_message_text("Задача не найдена")
+            return
+        t["done"] = True
+        write_user_tasks(data)
+        await query.edit_message_text(f"Готово ✅ Задача #{task_id} отмечена выполненной")
+        return
+
+    if action == "prio_task":
+        try:
+            task_id = int(arg)
+        except ValueError:
+            return
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("low", callback_data=f"setprio|{task_id}|low"), InlineKeyboardButton("normal", callback_data=f"setprio|{task_id}|normal"), InlineKeyboardButton("high", callback_data=f"setprio|{task_id}|high")]]
+        )
+        await query.edit_message_text("Выберите новый приоритет:", reply_markup=keyboard)
+        return
+
+    if action == "setprio":
+        parts = arg.split("|")
+        try:
+            task_id = int(parts[0])
+        except Exception:
+            return
+        pr = parts[1] if len(parts) > 1 else "normal"
+        t = find_task(task_id)
+        if not t:
+            await query.edit_message_text("Задача не найдена")
+            return
+        t["priority"] = pr
+        write_user_tasks(data)
+        await query.edit_message_text(f"Приоритет обновлён: #{task_id} -> {pr}")
+        return
+
+    if action == "due_task":
+        try:
+            task_id = int(arg)
+        except ValueError:
+            return
+        # ask user to send a date string
+        context.user_data["set_due_task_id"] = task_id
+        await query.edit_message_text("Отправьте дату в формате YYYY-MM-DD [HH:MM]")
+        return
+
+    if action == "cal_add":
+        try:
+            task_id = int(arg)
+        except ValueError:
+            return
+        # reuse existing calendar_add logic by simulating args
+        class Dummy:
+            pass
+        context.args = [str(task_id)]
+        await calendar_add(update, context)
+        return
+
+    if action == "cal_edit":
+        try:
+            task_id = int(arg)
+        except ValueError:
+            return
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Удалить событие", callback_data=f"caldel|{task_id}")]]
+        )
+        await query.edit_message_text("Выберите действие с событием календаря:", reply_markup=keyboard)
+        return
+
+    if action == "caldel":
+        try:
+            task_id = int(arg)
+        except ValueError:
+            return
+        context.args = [str(task_id)]
+        await calendar_delete(update, context)
+        return
+
+    # ignore other/noop
+    if action == "noop":
+        return
+
+
+async def on_due_text_after_inline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if "set_due_task_id" not in context.user_data:
+        return
+    task_id = context.user_data.pop("set_due_task_id")
+    due_iso = parse_due_datetime((update.message.text or "").strip().split())
+    if not due_iso:
+        await update.message.reply_text("Неверный формат даты. Повторите команду /due или используйте /menu → Установить дедлайн.")
+        return
+    data = read_user_tasks()
+    chat_id = str(update.effective_chat.id)
+    tasks = data.get(chat_id, [])
+    for t in tasks:
+        if t.get("id") == task_id:
+            t["due_iso"] = due_iso
+            write_user_tasks(data)
+            await update.message.reply_text(f"Дедлайн установлен для задачи #{task_id}: {due_iso}")
+            return
+    await update.message.reply_text("Задача не найдена")
 
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -387,9 +723,27 @@ def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. See .env.example and README.")
 
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    async def post_init(application: Application) -> None:
+        await application.bot.set_my_commands(
+            [
+                BotCommand("start", "Показать помощь и меню"),
+                BotCommand("menu", "Показать меню"),
+                BotCommand("add", "Добавить задачу (мастер)"),
+                BotCommand("list", "Список задач"),
+                BotCommand("done", "Отметить выполненной (через список)"),
+                BotCommand("setpriority", "Изменить приоритет (через список)"),
+                BotCommand("due", "Установить дедлайн (через список)"),
+                BotCommand("calendar_auth", "Привязать Google Calendar"),
+                BotCommand("calendar_add", "Добавить в календарь (через список)"),
+                BotCommand("calendar_delete", "Удалить событие календаря"),
+            ]
+        )
+
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("menu", show_menu))
     app.add_handler(CommandHandler("add", add_task))
     app.add_handler(CommandHandler("list", list_tasks))
     app.add_handler(CommandHandler("done", done_task))
@@ -398,6 +752,29 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("calendar_auth", calendar_auth))
     app.add_handler(CommandHandler("calendar_add", calendar_add))
     app.add_handler(CommandHandler("calendar_delete", calendar_delete))
+    # Step-by-step conversations and inline actions
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            CommandHandler("add", add_wizard_start),
+            MessageHandler(filters.TEXT & filters.Regex(f"^{BTN_ADD}$"), add_wizard_start),
+        ],
+        states={
+            ADD_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_wizard_title)],
+            ADD_DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_wizard_datetime)],
+            ADD_PRIORITY: [CallbackQueryHandler(add_wizard_priority, pattern=r"^prio\|")],
+            ADD_CALENDAR: [CallbackQueryHandler(add_wizard_calendar, pattern=r"^addcal\|")],
+        },
+        fallbacks=[],
+    ))
+    app.add_handler(CommandHandler("done", choose_task_for_done))
+    app.add_handler(CommandHandler("setpriority", choose_task_for_priority))
+    app.add_handler(CommandHandler("due", choose_task_for_due))
+    app.add_handler(CommandHandler("calendar_add", choose_task_for_calendar))
+    app.add_handler(CallbackQueryHandler(on_inline_action, pattern=r"^(done|prio_task|setprio|due_task|cal_add|cal_edit|caldel)\|"))
+    # Text triggers for menu as well
+    app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) & (filters.Regex(r"^(Меню|Menu)$")), show_menu))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_selection))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_due_text_after_inline))
 
     return app
 
